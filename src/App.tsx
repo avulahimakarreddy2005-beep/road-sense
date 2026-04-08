@@ -4,6 +4,7 @@ import { Camera, Map as MapIcon, AlertTriangle, CheckCircle, Upload, Info, BarCh
 import { motion, AnimatePresence } from "motion/react";
 import L from "leaflet";
 import { detectRoadDefects, DetectionResult } from "./lib/gemini";
+import { analyzeImage, AnalysisResult } from "./services/imageAnalysis";
 import Auth from "./components/Auth";
 
 // Fix Leaflet icon issue
@@ -44,6 +45,13 @@ export default function App() {
   const [detections, setDetections] = useState<DetectionRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [lastSubmission, setLastSubmission] = useState<any>(null);
+  const [pendingReview, setPendingReview] = useState<{
+    file: File;
+    previewUrl: string;
+    aiResult: DetectionResult;
+    analysis: AnalysisResult;
+  } | null>(null);
   const [userLocation, setUserLocation] = useState<[number, number]>([51.505, -0.09]);
 
   useEffect(() => {
@@ -84,61 +92,100 @@ export default function App() {
     try {
       const res = await fetch("/api/detections");
       if (res.ok) {
-        const data = await res.json();
-        setDetections(data);
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await res.json();
+          setDetections(data);
+        } else {
+          const text = await res.text();
+          console.error("Expected JSON but received:", text.substring(0, 100));
+          throw new Error("Server returned HTML instead of JSON. This usually happens when the API route is not found or the user is not authenticated.");
+        }
+      } else {
+        const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
+        console.error("Failed to fetch detections:", errorData.error);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to fetch detections", err);
     }
   };
 
   const processFile = async (file: File) => {
     setLoading(true);
-    setUploadStatus("Analyzing image with AI...");
+    setUploadStatus("Performing fast on-device analysis...");
 
     try {
-      // Convert to base64 for Gemini
+      // 1. Fast On-Device Analysis (TF.js + Canvas)
+      const analysis = await analyzeImage(file);
+      
+      setUploadStatus("Analyzing road defects with Gemini AI...");
+      
+      // 2. Deep Analysis (Gemini)
       const reader = new FileReader();
       reader.readAsDataURL(file);
       reader.onload = async () => {
         const base64 = (reader.result as string).split(",")[1];
-        
-        // AI Detection
         const aiResult = await detectRoadDefects(base64);
         
-        // Simulate Traffic Volume and Priority
-        const trafficVolume = Math.floor(Math.random() * 1000);
-        const priorityScore = SEVERITY_WEIGHTS[aiResult.severity] * trafficVolume;
-
-        // Prepare form data for backend
-        const formData = new FormData();
-        formData.append("image", file);
-        formData.append("lat", userLocation[0].toString());
-        formData.append("lon", userLocation[1].toString());
-        formData.append("timestamp", new Date().toISOString());
-        formData.append("severity", aiResult.severity);
-        formData.append("class", aiResult.class);
-        formData.append("traffic_volume", trafficVolume.toString());
-        formData.append("priority_score", priorityScore.toString());
-        formData.append("description", aiResult.description);
-
-        const res = await fetch("/api/detections", {
-          method: "POST",
-          body: formData,
+        setPendingReview({
+          file,
+          previewUrl: reader.result as string,
+          aiResult,
+          analysis
         });
-
-        if (res.ok) {
-          setUploadStatus("Report submitted successfully!");
-          fetchDetections();
-          setTimeout(() => setUploadStatus(null), 3000);
-        } else {
-          setUploadStatus("Failed to submit report.");
-        }
         setLoading(false);
+        setUploadStatus(null);
       };
     } catch (err) {
       console.error(err);
       setUploadStatus("Error processing image.");
+      setLoading(false);
+    }
+  };
+
+  const submitComplaint = async (editedResult: DetectionResult) => {
+    if (!pendingReview) return;
+    
+    setLoading(true);
+    setUploadStatus("Submitting official report...");
+
+    try {
+      const trafficVolume = Math.floor(Math.random() * 1000);
+      const priorityScore = SEVERITY_WEIGHTS[editedResult.severity] * trafficVolume;
+
+      const formData = new FormData();
+      formData.append("image", pendingReview.file);
+      formData.append("lat", userLocation[0].toString());
+      formData.append("lon", userLocation[1].toString());
+      formData.append("timestamp", new Date().toISOString());
+      formData.append("severity", editedResult.severity);
+      formData.append("class", editedResult.class);
+      formData.append("traffic_volume", trafficVolume.toString());
+      formData.append("priority_score", priorityScore.toString());
+      formData.append("description", editedResult.description);
+
+      const res = await fetch("/api/detections", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setLastSubmission({
+          id: data.id,
+          timestamp: new Date().toISOString(),
+          image: pendingReview.previewUrl,
+          class: editedResult.class
+        });
+        setPendingReview(null);
+        fetchDetections();
+      } else {
+        setUploadStatus("Failed to submit report.");
+      }
+    } catch (err) {
+      console.error(err);
+      setUploadStatus("Error submitting report.");
+    } finally {
       setLoading(false);
     }
   };
@@ -242,6 +289,11 @@ export default function App() {
             loading={loading} 
             status={uploadStatus} 
             location={userLocation}
+            lastSubmission={lastSubmission}
+            pendingReview={pendingReview}
+            onReset={() => { setLastSubmission(null); setPendingReview(null); }}
+            onTrack={() => setView("municipal")}
+            onSubmitReview={submitComplaint}
           />
         ) : view === "municipal" ? (
           <MunicipalDashboard detections={detections} onUpdateStatus={fetchDetections} />
@@ -257,12 +309,19 @@ function Loader2({ className }: { className?: string }) {
   return <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 1, ease: "linear" }} className={className}><RefreshCw className="w-full h-full" /></motion.div>;
 }
 
-function CitizenPortal({ onUpload, onCapture, loading, status, location }: any) {
+function CitizenPortal({ onUpload, onCapture, loading, status, location, lastSubmission, pendingReview, onReset, onTrack, onSubmitReview }: any) {
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [capturedImage, setCapturedImage] = useState<{ blob: Blob, url: string } | null>(null);
+  const [editedResult, setEditedResult] = useState<DetectionResult | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    if (pendingReview) {
+      setEditedResult(pendingReview.aiResult);
+    }
+  }, [pendingReview]);
 
   const startCamera = async () => {
     try {
@@ -300,10 +359,18 @@ function CitizenPortal({ onUpload, onCapture, loading, status, location }: any) 
       }
     } catch (err: any) {
       console.error("Error accessing camera:", err);
-      const msg = err.name === "NotAllowedError" || err.message.includes("Permission") 
-        ? "Camera permission denied or dismissed. Please enable camera access in your browser settings or try opening the app in a new tab."
+      const isPermissionError = err.name === "NotAllowedError" || err.message.includes("Permission");
+      const msg = isPermissionError
+        ? "Camera permission denied or dismissed. This app is running in an iframe, which may block camera access."
         : "Could not access camera: " + err.message;
-      alert(msg);
+      
+      if (isPermissionError) {
+        if (confirm(`${msg}\n\nWould you like to open the app in a new tab to enable camera access?`)) {
+          window.open(window.location.href, "_blank");
+        }
+      } else {
+        alert(msg);
+      }
     }
   };
 
@@ -360,6 +427,197 @@ function CitizenPortal({ onUpload, onCapture, loading, status, location }: any) 
       if (capturedImage) URL.revokeObjectURL(capturedImage.url);
     };
   }, [capturedImage]);
+
+  if (pendingReview && editedResult) {
+    return (
+      <div className="flex-1 p-6 flex flex-col items-center justify-start max-w-4xl mx-auto space-y-8 pt-12">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-4 text-center"
+        >
+          <h2 className="text-4xl font-serif font-bold text-navy-india tracking-tight">Review Your Complaint</h2>
+          <p className="text-slate-600 text-lg">Verify the AI analysis and adjust details if necessary.</p>
+        </motion.div>
+
+        <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* Image & Quality */}
+          <div className="space-y-6">
+            <div className="gov-card overflow-hidden">
+              <img src={pendingReview.previewUrl} alt="Preview" className="w-full h-auto" />
+              <div className="p-6 bg-slate-50 border-t border-slate-200">
+                <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">On-Device Quality Check (Fast Scan)</h4>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className={`p-3 rounded-lg border flex items-center gap-3 ${pendingReview.analysis.quality.isBlurry ? "bg-red-50 border-red-100 text-red-700" : "bg-green-50 border-green-100 text-green-700"}`}>
+                    {pendingReview.analysis.quality.isBlurry ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
+                    <div className="flex flex-col">
+                      <span className="text-[10px] uppercase font-bold">Focus</span>
+                      <span className="text-xs font-bold">{pendingReview.analysis.quality.isBlurry ? "Blurry" : "Sharp"}</span>
+                    </div>
+                  </div>
+                  <div className={`p-3 rounded-lg border flex items-center gap-3 ${pendingReview.analysis.quality.isDark ? "bg-red-50 border-red-100 text-red-700" : "bg-green-50 border-green-100 text-green-700"}`}>
+                    {pendingReview.analysis.quality.isDark ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
+                    <div className="flex flex-col">
+                      <span className="text-[10px] uppercase font-bold">Lighting</span>
+                      <span className="text-xs font-bold">{pendingReview.analysis.quality.isDark ? "Dark" : "Good"}</span>
+                    </div>
+                  </div>
+                </div>
+                
+                {pendingReview.analysis.detections.length > 0 && (
+                  <div className="mt-4 pt-4 border-t border-slate-200">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block mb-2">TF.js Detected Objects</span>
+                    <div className="flex flex-wrap gap-2">
+                      {pendingReview.analysis.detections.map((d: any, i: number) => (
+                        <span key={i} className="bg-navy-india text-white text-[10px] px-2 py-1 rounded font-bold uppercase">
+                          {d.class} ({(d.score * 100).toFixed(0)}%)
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Edit Form */}
+          <div className="space-y-6">
+            <div className="gov-card p-8 space-y-6">
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Complaint Category</label>
+                  <select 
+                    value={editedResult.class}
+                    onChange={(e) => setEditedResult({...editedResult, class: e.target.value as any})}
+                    className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-saffron outline-none font-bold text-navy-india"
+                  >
+                    <option value="Pothole">Pothole</option>
+                    <option value="Crack">Crack</option>
+                    <option value="Faded Markings">Faded Markings</option>
+                    <option value="Debris">Debris</option>
+                    <option value="Other">Other / General Maintenance</option>
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Severity Level</label>
+                  <div className="flex gap-2">
+                    {["Low", "Medium", "High"].map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => setEditedResult({...editedResult, severity: s as any})}
+                        className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all border ${editedResult.severity === s ? "bg-navy-india text-white border-navy-india" : "bg-white text-slate-400 border-slate-200 hover:bg-slate-50"}`}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Description</label>
+                  <textarea 
+                    value={editedResult.description}
+                    onChange={(e) => setEditedResult({...editedResult, description: e.target.value})}
+                    rows={4}
+                    className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-saffron outline-none text-sm text-slate-700"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-6 border-t border-slate-100 flex gap-3">
+                <button 
+                  onClick={onReset}
+                  className="flex-1 px-6 py-3 bg-white border border-slate-200 text-slate-600 rounded-lg font-bold text-sm hover:bg-slate-50 transition-all"
+                >
+                  Discard
+                </button>
+                <button 
+                  onClick={() => onSubmitReview(editedResult)}
+                  className="flex-[2] gov-btn-secondary flex items-center justify-center gap-2"
+                >
+                  <Send className="w-4 h-4" />
+                  Confirm & Submit
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-amber-50 border border-amber-100 p-4 rounded-xl flex gap-3">
+              <Info className="w-5 h-5 text-amber-600 shrink-0" />
+              <p className="text-[10px] text-amber-800 leading-relaxed">
+                <strong>Official Disclaimer:</strong> Providing false information or misrepresenting road conditions is a punishable offense under the Municipal Act. Please ensure all details are accurate before submission.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (lastSubmission) {
+    return (
+      <div className="flex-1 p-6 flex flex-col items-center justify-center max-w-4xl mx-auto space-y-8">
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="w-full max-w-lg gov-card overflow-hidden"
+        >
+          <div className="bg-green-india p-8 flex flex-col items-center text-white text-center space-y-4">
+            <div className="bg-white/20 p-4 rounded-full backdrop-blur-sm">
+              <CheckCircle className="w-16 h-16" />
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-2xl font-serif font-bold">Complaint Registered Successfully</h3>
+              <p className="text-white/80 text-sm font-medium">Photo uploaded successfully ✓</p>
+            </div>
+          </div>
+
+          <div className="p-8 space-y-6">
+            <div className="flex gap-6 items-start">
+              <div className="w-24 h-24 bg-slate-100 rounded-lg overflow-hidden border-2 border-slate-100 shadow-inner flex-shrink-0">
+                <img src={lastSubmission.image} alt="Submission" className="w-full h-full object-cover" />
+              </div>
+              <div className="flex-1 space-y-3">
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Complaint ID</span>
+                  <p className="text-sm font-mono font-bold text-navy-india">#GOI-RS-{lastSubmission.id}</p>
+                </div>
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Lodged On</span>
+                  <p className="text-xs font-bold text-slate-700">{new Date(lastSubmission.timestamp).toLocaleString()}</p>
+                </div>
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Classification</span>
+                  <p className="text-xs font-bold text-navy-india uppercase tracking-wider">{lastSubmission.class}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button 
+                onClick={onTrack}
+                className="gov-btn-secondary flex items-center justify-center gap-2 py-3"
+              >
+                <BarChart3 className="w-4 h-4" />
+                Track Complaint
+              </button>
+              <button 
+                onClick={onReset}
+                className="gov-btn-primary flex items-center justify-center gap-2 py-3"
+              >
+                <RefreshCw className="w-4 h-4" />
+                Submit Another
+              </button>
+            </div>
+          </div>
+
+          <div className="bg-slate-50 px-8 py-4 border-t border-slate-200 flex items-center justify-center text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+            A confirmation has been sent to your registered email
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 p-6 flex flex-col items-center justify-start max-w-4xl mx-auto space-y-8 pt-12">

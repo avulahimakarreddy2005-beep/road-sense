@@ -79,15 +79,23 @@ async function startServer() {
     const bypass = process.env.BYPASS_AUTH === "true";
     const token = req.cookies.token;
 
+    console.log(`[AUTH] Path: ${req.path}, Bypass: ${bypass}, HasToken: ${!!token}`);
+
     if (bypass && !token) {
       req.user = { id: 0, email: "dev-user@roadsense.ai", bypass: true };
       return next();
     }
 
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    if (!token) {
+      console.warn(`[AUTH] No token for ${req.path}`);
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-      if (err) return res.status(403).json({ error: "Forbidden" });
+      if (err) {
+        console.error(`[AUTH] JWT Verify Error: ${err.message}`);
+        return res.status(403).json({ error: "Forbidden" });
+      }
       req.user = user;
       next();
     });
@@ -355,6 +363,12 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // 404 handler for API routes
+  app.use("/api/*", (req, res) => {
+    console.warn(`[API 404] ${req.method} ${req.originalUrl}`);
+    res.status(404).json({ error: `API route ${req.originalUrl} not found` });
   });
 
   // Vite middleware for development
