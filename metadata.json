@@ -1,0 +1,8 @@
+{
+  "name": "RoadSense AI",
+  "description": "Smart road infrastructure monitoring system using AI to detect potholes and cracks, prioritizing repairs based on severity and traffic volume.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
