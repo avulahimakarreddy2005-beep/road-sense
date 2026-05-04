@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from "react";
-import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
-import { Camera, Map as MapIcon, AlertTriangle, CheckCircle, Upload, Info, BarChart3, Navigation, Download, RefreshCw, Send, LogOut, User, TrendingUp, Clock, Lock, Shield, Mail } from "lucide-react";
+import { MapContainer, TileLayer, Marker, Popup, useMap, LayersControl } from "react-leaflet";
+import { Camera, Map as MapIcon, AlertTriangle, CheckCircle, Upload, Info, BarChart3, Navigation, Download, RefreshCw, Send, LogOut, User, TrendingUp, Clock, Lock, Shield, Mail, Search } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import L from "leaflet";
+import exifr from "exifr";
 import { detectRoadDefects, DetectionResult } from "./lib/gemini";
 import { analyzeImage, AnalysisResult } from "./services/imageAnalysis";
 import Auth from "./components/Auth";
@@ -23,6 +24,7 @@ interface DetectionRecord extends DetectionResult {
   id: number;
   lat: number;
   lon: number;
+  address?: string;
   timestamp: string;
   image_path: string;
   traffic_volume: number;
@@ -36,6 +38,16 @@ const SEVERITY_WEIGHTS = {
   Low: 1,
   Medium: 2,
   High: 3
+};
+
+const safeJson = async (res: Response) => {
+  const contentType = res.headers.get("content-type");
+  if (contentType && contentType.includes("application/json")) {
+    return res.json();
+  }
+  const text = await res.text();
+  console.warn("Expected JSON but received:", text.substring(0, 100));
+  return { error: "Server returned non-JSON response" };
 };
 
 export default function App() {
@@ -53,14 +65,48 @@ export default function App() {
     analysis: AnalysisResult;
   } | null>(null);
   const [userLocation, setUserLocation] = useState<[number, number]>([51.505, -0.09]);
+  const [extractedAddress, setExtractedAddress] = useState<string | null>(null);
+  const [manualAddress, setManualAddress] = useState("");
+
+  const reverseGeocode = async (lat: number, lon: number) => {
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`);
+      if (res.ok) {
+        const data = await safeJson(res);
+        return data.display_name;
+      }
+    } catch (err) {
+      console.error("Reverse geocoding failed", err);
+    }
+    return null;
+  };
 
   useEffect(() => {
     checkAuth();
+    
+    let watchId: number | null = null;
+    
     if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition((pos) => {
-        setUserLocation([pos.coords.latitude, pos.coords.longitude]);
-      });
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          setUserLocation([pos.coords.latitude, pos.coords.longitude]);
+        },
+        (err) => {
+          console.error("Geolocation error:", err);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0
+        }
+      );
     }
+
+    return () => {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -73,7 +119,7 @@ export default function App() {
     try {
       const res = await fetch("/api/auth/me");
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeJson(res);
         setUser(data.user);
       }
     } catch (err) {
@@ -92,17 +138,10 @@ export default function App() {
     try {
       const res = await fetch("/api/detections");
       if (res.ok) {
-        const contentType = res.headers.get("content-type");
-        if (contentType && contentType.includes("application/json")) {
-          const data = await res.json();
-          setDetections(data);
-        } else {
-          const text = await res.text();
-          console.error("Expected JSON but received:", text.substring(0, 100));
-          throw new Error("Server returned HTML instead of JSON. This usually happens when the API route is not found or the user is not authenticated.");
-        }
+        const data = await safeJson(res);
+        setDetections(Array.isArray(data) ? data : []);
       } else {
-        const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
+        const errorData = await safeJson(res);
         console.error("Failed to fetch detections:", errorData.error);
       }
     } catch (err: any) {
@@ -112,9 +151,27 @@ export default function App() {
 
   const processFile = async (file: File) => {
     setLoading(true);
-    setUploadStatus("Performing fast on-device analysis...");
+    setUploadStatus("Extracting location metadata...");
 
     try {
+      // 0. Extract EXIF GPS data - Wrap in inner try-catch to be resilient to non-JPEG or corrupted metadata
+      try {
+        const exif = await exifr.gps(file);
+        if (exif && exif.latitude && exif.longitude) {
+          const address = await reverseGeocode(exif.latitude, exif.longitude);
+          setExtractedAddress(address);
+          setUserLocation([exif.latitude, exif.longitude]);
+        } else {
+          setExtractedAddress(null);
+          setManualAddress("");
+        }
+      } catch (exifErr) {
+        console.warn("EXIF extraction failed (expected for non-JPEG or files without GPS):", exifErr);
+        setExtractedAddress(null);
+        setManualAddress("");
+      }
+
+      setUploadStatus("Performing fast on-device analysis...");
       // 1. Fast On-Device Analysis (TF.js + Canvas)
       const analysis = await analyzeImage(file);
       
@@ -122,20 +179,33 @@ export default function App() {
       
       // 2. Deep Analysis (Gemini)
       const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = async () => {
-        const base64 = (reader.result as string).split(",")[1];
-        const aiResult = await detectRoadDefects(base64);
-        
-        setPendingReview({
-          file,
-          previewUrl: reader.result as string,
-          aiResult,
-          analysis
-        });
+      reader.onerror = () => {
+        console.error("FileReader error");
+        setUploadStatus("Error reading file.");
         setLoading(false);
-        setUploadStatus(null);
       };
+      reader.onload = async () => {
+        try {
+          const base64 = (reader.result as string).split(",")[1];
+          const aiResult = await detectRoadDefects(base64);
+          
+          setPendingReview({
+            file,
+            previewUrl: reader.result as string,
+            aiResult,
+            analysis
+          });
+          setLoading(false);
+          setUploadStatus(null);
+        } catch (err) {
+          console.error("Gemini analysis failed:", err);
+          setUploadStatus("AI Analysis failed. You can still submit manually.");
+          // Still allow review with default empty/unknown result if AI fails?
+          // For now let's just show the error.
+          setLoading(false);
+        }
+      };
+      reader.readAsDataURL(file);
     } catch (err) {
       console.error(err);
       setUploadStatus("Error processing image.");
@@ -163,6 +233,7 @@ export default function App() {
       formData.append("traffic_volume", trafficVolume.toString());
       formData.append("priority_score", priorityScore.toString());
       formData.append("description", editedResult.description);
+      formData.append("address", extractedAddress || manualAddress || "Unknown Location");
 
       const res = await fetch("/api/detections", {
         method: "POST",
@@ -170,7 +241,7 @@ export default function App() {
       });
 
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeJson(res);
         setLastSubmission({
           id: data.id,
           timestamp: new Date().toISOString(),
@@ -289,9 +360,17 @@ export default function App() {
             loading={loading} 
             status={uploadStatus} 
             location={userLocation}
+            extractedAddress={extractedAddress}
+            manualAddress={manualAddress}
+            setManualAddress={setManualAddress}
             lastSubmission={lastSubmission}
             pendingReview={pendingReview}
-            onReset={() => { setLastSubmission(null); setPendingReview(null); }}
+            onReset={() => { 
+              setLastSubmission(null); 
+              setPendingReview(null); 
+              setManualAddress("");
+              setExtractedAddress(null);
+            }}
             onTrack={() => setView("municipal")}
             onSubmitReview={submitComplaint}
           />
@@ -309,7 +388,7 @@ function Loader2({ className }: { className?: string }) {
   return <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 1, ease: "linear" }} className={className}><RefreshCw className="w-full h-full" /></motion.div>;
 }
 
-function CitizenPortal({ onUpload, onCapture, loading, status, location, lastSubmission, pendingReview, onReset, onTrack, onSubmitReview }: any) {
+function CitizenPortal({ onUpload, onCapture, loading, status, location, extractedAddress, manualAddress, setManualAddress, lastSubmission, pendingReview, onReset, onTrack, onSubmitReview }: any) {
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [capturedImage, setCapturedImage] = useState<{ blob: Blob, url: string } | null>(null);
   const [editedResult, setEditedResult] = useState<DetectionResult | null>(null);
@@ -522,6 +601,26 @@ function CitizenPortal({ onUpload, onCapture, loading, status, location, lastSub
                     rows={4}
                     className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-saffron outline-none text-sm text-slate-700"
                   />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Location / Address</label>
+                  {extractedAddress ? (
+                    <div className="p-3 bg-green-50 border border-green-100 rounded-lg flex items-start gap-3">
+                      <MapIcon className="w-4 h-4 text-green-600 shrink-0 mt-0.5" />
+                      <span className="text-xs font-bold text-green-800">{extractedAddress}</span>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <input 
+                        type="text"
+                        placeholder="Enter street name, landmark, or area..."
+                        value={manualAddress}
+                        onChange={(e) => setManualAddress(e.target.value)}
+                        className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-saffron outline-none text-sm text-navy-india"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -770,8 +869,13 @@ function CitizenPortal({ onUpload, onCapture, loading, status, location, lastSub
       )}
 
       <div className="flex items-center gap-4 text-[10px] font-bold text-slate-500 bg-white border border-slate-200 px-6 py-3 rounded-full shadow-sm">
-        <Navigation className="w-4 h-4 text-navy-india" />
-        <span className="tracking-widest">GEO-LOCATION: {location[0].toFixed(6)} N, {location[1].toFixed(6)} E</span>
+        <div className="relative">
+          <Navigation className="w-4 h-4 text-navy-india" />
+          <span className="absolute -top-1 -right-1 w-2 h-2 bg-green-500 rounded-full animate-ping"></span>
+        </div>
+        <span className="tracking-widest">
+          LIVE GPS: {location[0].toFixed(6)} N, {location[1].toFixed(6)} E
+        </span>
       </div>
     </div>
   );
@@ -780,6 +884,14 @@ function CitizenPortal({ onUpload, onCapture, loading, status, location, lastSub
 function MunicipalDashboard({ detections, onUpdateStatus }: { detections: DetectionRecord[], onUpdateStatus: () => void }) {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [escalating, setEscalating] = useState<number | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  
+  const filteredDetections = detections.filter(d => 
+    d.id.toString().includes(searchQuery) || 
+    d.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    d.class.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
   const selectedDetection = detections.find(d => d.id === selectedId);
 
   const SLA_THRESHOLD_DAYS = 7;
@@ -814,21 +926,33 @@ function MunicipalDashboard({ detections, onUpdateStatus }: { detections: Detect
     <div className="flex-1 flex flex-col md:flex-row h-full overflow-hidden">
       {/* Sidebar: Work Orders */}
       <div className="w-full md:w-96 border-r border-slate-200 bg-white flex flex-col h-full shadow-lg z-10">
-        <div className="p-6 border-b-2 border-green-india bg-slate-50">
-          <div className="flex items-center justify-between mb-3">
+        <div className="p-6 border-b-2 border-green-india bg-slate-50 space-y-4">
+          <div className="flex items-center justify-between">
             <h3 className="font-serif font-bold text-navy-india flex items-center gap-2">
               <BarChart3 className="w-5 h-5" />
               Grievance Queue
             </h3>
             <span className="bg-navy-india text-white text-[10px] px-2.5 py-1 rounded font-bold uppercase tracking-widest">
-              {detections.length} Total
+              {filteredDetections.length} Results
             </span>
           </div>
+          
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <input 
+              type="text"
+              placeholder="Search by ID or description..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 bg-white border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-saffron outline-none transition-all"
+            />
+          </div>
+          
           <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Priority Ranking: AI-Driven</p>
         </div>
 
         <div className="flex-1 overflow-y-auto divide-y divide-slate-100">
-          {detections.map((d, index) => {
+          {filteredDetections.map((d, index) => {
             const sla = getSLAStatus(d.timestamp, d.status);
             return (
               <button
@@ -870,8 +994,28 @@ function MunicipalDashboard({ detections, onUpdateStatus }: { detections: Detect
       <div className="flex-1 relative flex flex-col">
         <div className="flex-1">
           <MapContainer center={[51.505, -0.09]} zoom={13} className="h-full w-full">
-            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-            {detections.map(d => (
+            <LayersControl position="topright">
+              <LayersControl.BaseLayer checked name="Street View">
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+              </LayersControl.BaseLayer>
+              <LayersControl.BaseLayer name="Satellite View">
+                <TileLayer
+                  attribution='&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EBP, and the GIS User Community'
+                  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                />
+              </LayersControl.BaseLayer>
+              <LayersControl.BaseLayer name="Terrain View">
+                <TileLayer
+                  attribution='&copy; <a href="https://www.opentopomap.org">OpenTopoMap</a> contributors'
+                  url="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+                />
+              </LayersControl.BaseLayer>
+            </LayersControl>
+
+            {filteredDetections.map(d => (
               <Marker key={d.id} position={[d.lat, d.lon]}>
                 <Popup>
                   <div className="p-1">
@@ -929,6 +1073,12 @@ function MunicipalDashboard({ detections, onUpdateStatus }: { detections: Detect
                         </span>
                       )}
                     </h3>
+                    {selectedDetection.address && (
+                      <div className="flex items-start gap-2 mt-2 text-slate-500">
+                        <MapIcon className="w-4 h-4 shrink-0 mt-0.5" />
+                        <p className="text-sm leading-relaxed">{selectedDetection.address}</p>
+                      </div>
+                    )}
                     <p className="text-slate-500 mt-2 leading-relaxed">{selectedDetection.description}</p>
                   </div>
                   <button 
@@ -1027,7 +1177,7 @@ function StatusUpdateForm({ detectionId, currentStatus, onSuccess }: { detection
       if (res.ok) {
         onSuccess();
       } else {
-        const data = await res.json();
+        const data = await safeJson(res);
         setError(data.error || "Failed to update status");
       }
     } catch (err) {
@@ -1199,7 +1349,7 @@ function UserProfile({ user }: { user: any }) {
         body: JSON.stringify({ currentPassword, newPassword }),
       });
 
-      const data = await res.json();
+      const data = await safeJson(res);
       if (res.ok) {
         setMessage({ type: "success", text: "Password updated successfully" });
         setCurrentPassword("");

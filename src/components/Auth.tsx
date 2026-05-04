@@ -25,6 +25,16 @@ export default function Auth({ onLogin }: AuthProps) {
     }
   }, [cooldown]);
 
+  const safeJson = async (res: Response) => {
+    const contentType = res.headers.get("content-type");
+    if (contentType && contentType.includes("application/json")) {
+      return res.json();
+    }
+    const text = await res.text();
+    console.warn("Expected JSON but received:", text.substring(0, 100));
+    return { error: "Server returned non-JSON response" };
+  };
+
   const handlePasswordAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -37,7 +47,7 @@ export default function Auth({ onLogin }: AuthProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (res.ok) {
         if (mode === "login") {
           setSuccess("Login successful! Redirecting...");
@@ -67,7 +77,7 @@ export default function Auth({ onLogin }: AuthProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (res.ok) {
         setOtpSent(true);
         setCooldown(30);
@@ -93,7 +103,7 @@ export default function Auth({ onLogin }: AuthProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, otp }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (res.ok) {
         setSuccess("OTP Verified! Welcome to RoadSense AI.");
         setTimeout(() => onLogin(data.user), 2000);

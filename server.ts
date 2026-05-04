@@ -44,6 +44,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lat REAL,
     lon REAL,
+    address TEXT,
     timestamp TEXT,
     severity TEXT,
     class TEXT,
@@ -310,13 +311,13 @@ async function startServer() {
   });
 
   app.post("/api/detections", authenticateToken, upload.single("image"), (req, res) => {
-    const { lat, lon, timestamp, severity, class: className, traffic_volume, priority_score, description } = req.body;
+    const { lat, lon, address, timestamp, severity, class: className, traffic_volume, priority_score, description } = req.body;
     const image_path = req.file ? `/uploads/${req.file.filename}` : null;
 
     const info = db.prepare(`
-      INSERT INTO detections (lat, lon, timestamp, severity, class, image_path, traffic_volume, priority_score, description)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(lat, lon, timestamp, severity, className, image_path, traffic_volume, priority_score, description);
+      INSERT INTO detections (lat, lon, address, timestamp, severity, class, image_path, traffic_volume, priority_score, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(lat, lon, address, timestamp, severity, className, image_path, traffic_volume, priority_score, description);
 
     res.json({ id: info.lastInsertRowid, status: "success" });
   });
